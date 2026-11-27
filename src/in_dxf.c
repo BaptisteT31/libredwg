@@ -571,6 +571,10 @@ dxf_skip_ws (Bit_Chain *dat)
           }                                                                   \
         dat->byte += (unsigned char *)endptr - &dat->chain[dat->byte];        \
       }                                                                       \
+    while (dat->byte < dat->size                                             \
+           && (dat->chain[dat->byte] == ' '                                  \
+               || dat->chain[dat->byte] == '\t'))                            \
+      dat->byte++;                                                           \
     if (errno == ERANGE)                                                      \
       return (rettype)num;                                                    \
     if (dat->byte + 1 >= dat->size)                                           \

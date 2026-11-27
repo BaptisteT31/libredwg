@@ -2467,6 +2467,147 @@ test_dxf_eed_binary (void)
   return numfailed ();
 }
 
+/* Spaces and tabs after an ASCII DXF integer are padding before the line
+   end, in group codes and in integer values. String values keep their
+   spaces, and another token after the integer is still an error. */
+static size_t
+integer_padding_dxf (char *buf, const unsigned pad, const int crlf,
+                     const char *first, const size_t first_len)
+{
+  static const char *const lines[]
+      = { "0",   "SECTION",
+          "2",   "HEADER",
+          "9",   "$ACADVER",
+          "1",   "AC1018",
+          "999", "Padding to satisfy the minimum DXF input size.",
+          "0",   "ENDSEC",
+          "0",   "SECTION",
+          "2",   "ENTITIES",
+          "0",   "LINE",
+          "5",   "10",
+          "100", "AcDbEntity",
+          "8",   "0",
+          "62",  "3",
+          "100", "AcDbLine",
+          "10",  "1.25",
+          "20",  "2.5",
+          "30",  "0",
+          "11",  "4.0",
+          "21",  "5.5",
+          "31",  "0",
+          "0",   "TEXT",
+          "5",   "11",
+          "100", "AcDbEntity",
+          "8",   "0",
+          "100", "AcDbText",
+          "10",  "0",
+          "20",  "0",
+          "30",  "0",
+          "40",  "1.0",
+          "1",   "  keep text spaces  ",
+          "0",   "ENDSEC",
+          "0",   "EOF",
+          NULL };
+  size_t used = 0;
+  unsigned i;
+  for (i = 0; lines[i]; i++)
+    {
+      const int is_code = !(i & 1);
+      if (i == 0 && first)
+        {
+          memcpy (buf, first, first_len);
+          used = first_len;
+        }
+      else
+        {
+          memcpy (buf + used, lines[i], strlen (lines[i]));
+          used += strlen (lines[i]);
+        }
+      if ((is_code && (pad & 1))
+          || (!is_code && (pad & 2) && !strcmp (lines[i - 1], "62")))
+        {
+          memcpy (buf + used, " \t ", 3);
+          used += 3;
+        }
+      if (crlf)
+        buf[used++] = '\r';
+      buf[used++] = '\n';
+    }
+  buf[used] = '\0';
+  return used;
+}
+
+static int
+test_dxf_integer_padding (void)
+{
+  static const struct
+  {
+    const char *code;
+    size_t len;
+  } bad[] = { { "0x", 2 }, { "0 x", 3 }, { "0 2", 3 }, { "0\0", 2 } };
+  const int lvl = loglevel;
+  char buf[2048];
+  unsigned pad, i;
+  int crlf;
+
+  failed = 0;
+  // pad 1: group codes, 2: the color value, 3: both
+  for (pad = 0; pad < 4; pad++)
+    for (crlf = 0; crlf <= 1; crlf++)
+      {
+        Dwg_Data dwg = { 0 };
+        Bit_Chain dat = { 0 };
+        Dwg_Object *line, *text;
+        int error;
+
+        dat.size = integer_padding_dxf (buf, pad, crlf, NULL, 0);
+        dat.chain = (unsigned char *)buf;
+        dwg.header.version = R_2004;
+        error = dwg_read_dxf (&dat, &dwg);
+        loglevel = lvl;
+        line = first_object (&dwg, DWG_TYPE_LINE);
+        text = first_object (&dwg, DWG_TYPE_TEXT);
+        if (error >= DWG_ERR_CRITICAL || !line || !text)
+          fail ("dxf_integer_padding %u %s: error 0x%x, LINE %d, TEXT %d", pad,
+                crlf ? "CRLF" : "LF", error, line != NULL, text != NULL);
+        else
+          {
+            const Dwg_Entity_LINE *l = line->tio.entity->tio.LINE;
+            const char *s = text->tio.entity->tio.TEXT->text_value;
+            if (l->start.x != 1.25 || l->start.y != 2.5 || l->end.x != 4.0
+                || l->end.y != 5.5 || line->tio.entity->color.index != 3)
+              fail ("dxf_integer_padding %u %s: LINE changed", pad,
+                    crlf ? "CRLF" : "LF");
+            else if (!s || strcmp (s, "  keep text spaces  "))
+              fail ("dxf_integer_padding %u %s: TEXT value \"%s\"", pad,
+                    crlf ? "CRLF" : "LF", s ? s : "");
+            else
+              ok ("dxf_integer_padding %u %s", pad, crlf ? "CRLF" : "LF");
+          }
+        dwg_free (&dwg);
+        loglevel = lvl;
+      }
+  for (i = 0; i < sizeof (bad) / sizeof (bad[0]); i++)
+    {
+      Dwg_Data dwg = { 0 };
+      Bit_Chain dat = { 0 };
+      int error;
+
+      dat.size = integer_padding_dxf (buf, 0, 0, bad[i].code, bad[i].len);
+      dat.chain = (unsigned char *)buf;
+      dwg.header.version = R_2004;
+      error = dwg_read_dxf (&dat, &dwg);
+      loglevel = lvl;
+      if (error >= DWG_ERR_CRITICAL)
+        ok ("dxf_integer_padding: rejects group code %u", i);
+      else
+        fail ("dxf_integer_padding: accepted group code %u", i);
+      dwg_free (&dwg);
+      loglevel = lvl;
+    }
+  return numfailed ();
+}
+
 /* Repeated vertices in one leader line must not create new lines. */
 static int
 test_multileader_vertices (void)
@@ -3914,6 +4055,7 @@ main (int argc, char *argv[])
   error += test_repeat_dxf (R_2000, 0);
   error += test_repeat_dxf (R_2000, 1);
   error += test_dxf_eed_binary ();
+  error += test_dxf_integer_padding ();
   error += test_dxf_reused_modelspace_error ();
   error += test_dxf_eval_node_missing_handle ();
   error += test_dxf_oleclient_ownership ();
