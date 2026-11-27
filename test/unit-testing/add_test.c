@@ -2773,6 +2773,97 @@ test_dxf_proxy_entity (void)
   return numfailed ();
 }
 
+/* $ANGBASE is in degrees in the DXF HEADER, in radians in the DWG header.
+   ASCII and binary DXF share the header reader. */
+#  define ANGBASE_COMMENT                                                     \
+    "This synthetic HEADER holds $ANGBASE with the controls $LTSCALE and "    \
+    "$ANGDIR, which must keep their values. The comment pads the input "      \
+    "above the 256 byte minimum of the DXF reader."
+
+static size_t
+angbase_dxfb (unsigned char *buf, const double angle)
+{
+  static const unsigned char prefix[]
+      = "AutoCAD Binary DXF\r\n\x1a\0"
+        "\0\0SECTION\0\2\0HEADER\0\11\0$ACADVER\0\1\0AC1027\0"
+        "\347\3" ANGBASE_COMMENT "\0"
+        "\11\0$ANGBASE\0\62\0";
+  static const unsigned char scale[] = "\11\0$LTSCALE\0\50\0";
+  static const unsigned char suffix[]
+      = "\11\0$ANGDIR\0\106\0\1\0\0\0ENDSEC\0\0\0EOF\0";
+  const unsigned char *const parts[2] = { prefix, scale };
+  const size_t sizes[2] = { sizeof (prefix) - 1, sizeof (scale) - 1 };
+  const double reals[2] = { angle, 2.5 };
+  unsigned char *p = buf;
+  unsigned i, j;
+
+  for (i = 0; i < 2; i++)
+    {
+      uint64_t bits;
+      memcpy (p, parts[i], sizes[i]);
+      p += sizes[i];
+      memcpy (&bits, &reals[i], sizeof (bits));
+      for (j = 0; j < 8; j++)
+        *p++ = (unsigned char)(bits >> (8 * j)); // little-endian
+    }
+  memcpy (p, suffix, sizeof (suffix));
+  return (size_t)(p - buf) + sizeof (suffix) - 1;
+}
+
+static int
+test_dxf_header_angbase (void)
+{
+  static const double angles[] = { 0.0, 11.75, -25.5, 359.125 };
+  const int lvl = loglevel;
+  unsigned i, k;
+
+  failed = 0;
+  for (i = 0; i < sizeof (angles) / sizeof (angles[0]); i++)
+    for (k = 0; k < 3; k++)
+      {
+        // R2000 and R2013 ASCII, R2013 binary
+        const char *version = k ? "AC1027" : "AC1015";
+        const char *format = k == 2 ? "binary" : "ASCII";
+        const double expected = angles[i] * (acos (-1.0) / 180.0);
+        unsigned char buf[512];
+        Dwg_Data dwg = { 0 };
+        Bit_Chain dat = { 0 };
+        int error;
+
+        dat.chain = buf;
+        if (k == 2)
+          dat.size = angbase_dxfb (buf, angles[i]);
+        else
+          dat.size = (size_t)snprintf (
+              (char *)buf, sizeof (buf),
+              "0\nSECTION\n2\nHEADER\n9\n$ACADVER\n1\n%s\n"
+              "999\n" ANGBASE_COMMENT "\n"
+              "9\n$ANGBASE\n50\n%.17g\n9\n$LTSCALE\n40\n2.5\n"
+              "9\n$ANGDIR\n70\n1\n0\nENDSEC\n0\nEOF\n",
+              version, angles[i]);
+        dwg.header.version = dat.version = R_2013;
+        error
+            = k == 2 ? dwg_read_dxfb (&dat, &dwg) : dwg_read_dxf (&dat, &dwg);
+        loglevel = lvl;
+        if (error >= DWG_ERR_CRITICAL
+            || dwg.header.from_version != dwg_version_hdr_type (version))
+          fail ("dxf_header_angbase %s %s %g: error 0x%x", format, version,
+                angles[i], error);
+        else if (fabs (dwg.header_vars.ANGBASE - expected) > 1e-12)
+          fail ("dxf_header_angbase %s %s %g: ANGBASE %.17g, expected %.17g",
+                format, version, angles[i], dwg.header_vars.ANGBASE, expected);
+        else if (dwg.header_vars.LTSCALE != 2.5 || dwg.header_vars.ANGDIR != 1)
+          fail ("dxf_header_angbase %s %s %g: LTSCALE %g, ANGDIR %d", format,
+                version, angles[i], dwg.header_vars.LTSCALE,
+                (int)dwg.header_vars.ANGDIR);
+        else
+          ok ("dxf_header_angbase %s %s %g", format, version, angles[i]);
+        dwg_free (&dwg);
+        loglevel = lvl;
+      }
+  return numfailed ();
+}
+
 #endif
 
 #ifndef DISABLE_JSON
@@ -3918,6 +4009,7 @@ main (int argc, char *argv[])
   error += test_dxf_eval_node_missing_handle ();
   error += test_dxf_oleclient_ownership ();
   error += test_dxf_proxy_entity ();
+  error += test_dxf_header_angbase ();
 #endif
 #ifndef DISABLE_JSON
   error += test_json_sab_size ();

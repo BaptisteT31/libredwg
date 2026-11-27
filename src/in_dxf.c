@@ -1874,6 +1874,13 @@ dxf_header_read (Bit_Chain *restrict dat, Dwg_Data *restrict dwg)
                          pair->code);
               dwg_dynapi_header_set_value (dwg, &field[1], &tz, 1);
             }
+          else if (pair->type == DWG_VT_REAL && pair->code == 50
+                   && strEQc (field, "$ANGBASE"))
+            {
+              /* DXF group 50 is in degrees. The DWG field uses radians. */
+              _obj->ANGBASE = deg2rad (pair->value.d);
+              LOG_TRACE ("HEADER.ANGBASE = %f [BD 50]\n", _obj->ANGBASE);
+            }
           else
             {
               LOG_TRACE ("HEADER.%s [%s %d]\n", &field[1], f->type,
