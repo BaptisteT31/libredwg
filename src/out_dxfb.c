@@ -510,7 +510,18 @@ dxfb_convert_TU (const Bit_Chain *restrict dat, const BITCODE_TU wstr)
 #define VALUE_RCs(value, dxf) VALUE_INT (value, dxf)
 #define VALUE_BS(value, dxf) VALUE_INT (value, dxf)
 #define VALUE_BL(value, dxf) VALUE_INT (value, dxf)
-#define VALUE_BD(value, dxf) VALUE_RD (value, dxf)
+#define VALUE_BD(value, dxf)                                                  \
+  {                                                                           \
+    if (dxf >= 50 && dxf < 55)                                                \
+      {                                                                       \
+        BITCODE_RD _f = rad2deg (value);                                      \
+        VALUE_RD (_f, dxf);                                                   \
+      }                                                                       \
+    else                                                                      \
+      {                                                                       \
+        VALUE_RD (value, dxf);                                                \
+      }                                                                       \
+  }
 #define VALUE_RC(value, dxf)                                                  \
   {                                                                           \
     if (dxf)                                                                  \
@@ -635,11 +646,11 @@ dxfb_convert_TU (const Bit_Chain *restrict dat, const BITCODE_TU wstr)
       dxfb_write_rd (dat->fh, d);                                             \
     }                                                                         \
   }
-#define FIELD_RD(nam, dxf) VALUE_RD (_obj->nam, dxf)
+#define FIELD_RD(nam, dxf) VALUE_BD (_obj->nam, dxf)
 #define HEADER_RD(nam, dxf)                                                   \
   {                                                                           \
     HEADER_9 (nam);                                                           \
-    VALUE_RD (dwg->header_vars.nam, dxf);                                     \
+    VALUE_BD (dwg->header_vars.nam, dxf);                                     \
   }
 
 #define FIELD_RL(nam, dxf) VALUE_INT (_obj->nam, dxf)

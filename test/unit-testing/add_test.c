@@ -1392,6 +1392,299 @@ test_dxf_write_file (void)
   return ret;
 }
 
+/* The binary DXF writer writes the typed angles of groups 50 to 54 in
+   degrees, as the ASCII writer does. Raw doubles, like XRECORD data, ELLIPSE
+   parameters and the MTEXT direction, and the MLINESTYLE angles the spec
+   already converts, are written as they are. The values are taken from the
+   written bytes, not from the DXF importer. */
+struct dxf_written_real
+{
+  const char *record; // the group 0 type, or the group 9 header variable
+  const char *name;   // the group 2 name of the record, or NULL
+  short code;
+  double expected;
+  double value;
+  int found;
+};
+
+static void
+dxf_written_value (struct dxf_written_real *reals, const unsigned n,
+                   const char *record, const char *name, const short code,
+                   const double value)
+{
+  unsigned i;
+  for (i = 0; i < n; i++)
+    if (!reals[i].found && reals[i].code == code
+        && !strcmp (reals[i].record, record)
+        && (!reals[i].name || !strcmp (reals[i].name, name)))
+      {
+        reals[i].value = value;
+        reals[i].found = 1;
+      }
+}
+
+/* Walk all groups of a written R13+ DXF file up to its 0 EOF, which must be
+   at the end. */
+static int
+dxf_written_reals (unsigned char *buf, const size_t size, const int binary,
+                   struct dxf_written_real *reals, const unsigned n)
+{
+  static const char sentinel[] = "AutoCAD Binary DXF\r\n\x1a";
+  char record[64] = "", name[64] = "";
+  size_t pos = 0;
+
+  if (binary)
+    {
+      if (size < sizeof (sentinel)
+          || memcmp (buf, sentinel, sizeof (sentinel)))
+        return 0;
+      pos = sizeof (sentinel); // with its NUL
+    }
+  while (pos < size)
+    {
+      enum RESBUF_VALUE_TYPE type;
+      const char *s = NULL;
+      double d = 0.0;
+      short code;
+
+      if (binary)
+        {
+          if (pos + 2 > size)
+            return 0;
+          code = (short)(buf[pos] | (buf[pos + 1] << 8));
+          pos += 2;
+          type = dwg_resbuf_value_type (code);
+          switch (type)
+            {
+            case DWG_VT_REAL:
+            case DWG_VT_POINT3D:
+              {
+                uint64_t bits = 0;
+                unsigned j;
+                if (pos + 8 > size)
+                  return 0;
+                for (j = 0; j < 8; j++)
+                  bits |= (uint64_t)buf[pos + j] << (8 * j);
+                memcpy (&d, &bits, sizeof (d));
+                pos += 8;
+              }
+              break;
+            case DWG_VT_BOOL:
+              pos += 1;
+              break;
+            case DWG_VT_INT8: // as the writer: 16 bit
+            case DWG_VT_INT16:
+              pos += 2;
+              break;
+            case DWG_VT_INT32:
+              pos += 4;
+              break;
+            case DWG_VT_INT64:
+              pos += 8;
+              break;
+            case DWG_VT_BINARY:
+              if (pos >= size)
+                return 0;
+              pos += 1 + buf[pos];
+              break;
+            default: // strings and handles
+              {
+                const unsigned char *end
+                    = (const unsigned char *)memchr (&buf[pos], 0, size - pos);
+                if (!end)
+                  return 0;
+                s = (const char *)&buf[pos];
+                pos = (size_t)(end - buf) + 1;
+              }
+              break;
+            }
+          if (pos > size)
+            return 0;
+        }
+      else
+        {
+          char *line = (char *)&buf[pos];
+          char *end = (char *)memchr (line, '\n', size - pos);
+          char *value;
+          if (!end)
+            return 0;
+          *end = '\0';
+          code = (short)strtol (line, NULL, 10);
+          value = end + 1;
+          end = (char *)memchr (value, '\n',
+                                size - (size_t)(value - (char *)buf));
+          if (!end)
+            return 0;
+          pos = (size_t)(end - (char *)buf) + 1;
+          *end = '\0';
+          if (end > value && end[-1] == '\r')
+            end[-1] = '\0';
+          type = dwg_resbuf_value_type (code);
+          if (type == DWG_VT_REAL || type == DWG_VT_POINT3D)
+            d = strtod (value, NULL);
+          else
+            s = value;
+        }
+      if (code == 0 || code == 9)
+        {
+          if (!s)
+            return 0;
+          if (code == 0 && !strcmp (s, "EOF"))
+            return pos == size || (!binary && pos + 1 >= size);
+          snprintf (record, sizeof (record), "%s", s);
+          name[0] = '\0';
+        }
+      else if (code == 2 && s)
+        snprintf (name, sizeof (name), "%s", s);
+      else if (!s && (type == DWG_VT_REAL || type == DWG_VT_POINT3D))
+        dxf_written_value (reals, n, record, name, code, d);
+    }
+  return 0;
+}
+
+static unsigned char *
+dxf_written_file (const char *file, size_t *size)
+{
+  unsigned char *buf = NULL;
+  FILE *fp = fopen (file, "rb");
+  long len;
+  if (!fp)
+    return NULL;
+  if (!fseek (fp, 0, SEEK_END) && (len = ftell (fp)) > 0
+      && !fseek (fp, 0, SEEK_SET)
+      && (buf = (unsigned char *)malloc ((size_t)len + 1)))
+    {
+      *size = fread (buf, 1, (size_t)len, fp);
+      buf[*size] = '\0';
+    }
+  fclose (fp);
+  return buf;
+}
+
+static int
+test_dxfb_angles (void)
+{
+  const char file[] = "add_test_dxfb_angles.dxf";
+  const dwg_point_3d center = { 12.5, -23.25, 1.5 };
+  const dwg_point_3d end = { 13.5, -21.25, 1.5 };
+  const int lvl = loglevel;
+  int binary;
+
+  failed = 0;
+  for (binary = 0; binary <= 1; binary++)
+    {
+      struct dxf_written_real reals[] = {
+        { "ARC", NULL, 50, 12.5, 0.0, 0 },
+        { "ARC", NULL, 51, 203.25, 0.0, 0 },
+        { "TEXT", NULL, 50, 37.5, 0.0, 0 },
+        { "TEXT", NULL, 51, -17.25, 0.0, 0 },
+        { "INSERT", NULL, 50, 73.25, 0.0, 0 },
+        { "VPORT", "AngleViewport", 50, 42.25, 0.0, 0 },
+        { "VPORT", "AngleViewport", 51, 23.5, 0.0, 0 },
+        { "$ANGBASE", NULL, 50, 11.75, 0.0, 0 },
+        // not converted
+        { "ELLIPSE", NULL, 41, 0.625, 0.0, 0 },
+        { "ELLIPSE", NULL, 42, 4.875, 0.0, 0 },
+        { "MTEXT", NULL, 11, 0.0, 0.0, 0 },
+        { "MTEXT", NULL, 21, 0.0, 0.0, 0 },
+        { "XRECORD", NULL, 50, 0.875, 0.0, 0 },
+        { "MLINESTYLE", "AngleStyle", 51, 60.0, 0.0, 0 },
+        { "MLINESTYLE", "AngleStyle", 52, 75.0, 0.0, 0 },
+      };
+      const unsigned n = sizeof (reals) / sizeof (reals[0]);
+      Dwg_Data *dwg = dwg_new_Document (R_2013, 0, 0);
+      Dwg_Object_BLOCK_HEADER *mspace, *block;
+      Dwg_Entity_ARC *arc;
+      Dwg_Entity_TEXT *text;
+      Dwg_Entity_ELLIPSE *ellipse;
+      Dwg_Entity_MTEXT *mtext;
+      Dwg_Object_VPORT *vport;
+      Dwg_Object_MLINESTYLE *mlstyle;
+      Dwg_Object_DICTIONARY *dict;
+      Dwg_Object_XRECORD *xrecord;
+      unsigned char *buf = NULL;
+      size_t size = 0;
+      unsigned i;
+      int error;
+
+      if (!dwg || !dwg_model_space_object (dwg))
+        {
+          fail ("dxfb_angles: cannot create drawing");
+          return 1;
+        }
+      reals[10].expected = cos (0.75);
+      reals[11].expected = sin (0.75);
+      mspace = dwg_model_space_object (dwg)->tio.object->tio.BLOCK_HEADER;
+      block = dwg_add_BLOCK_HEADER (dwg, "AngleBlock");
+      arc = dwg_add_ARC (mspace, &center, 4.25, deg2rad (12.5),
+                         deg2rad (123.25));
+      text = dwg_add_TEXT (mspace, "Angle text", &center, 2.5);
+      ellipse = dwg_add_ELLIPSE (mspace, &center, 5.0, 0.5);
+      mtext = dwg_add_MTEXT (mspace, &center, 8.0, "Direction");
+      vport = dwg_add_VPORT (dwg, "AngleViewport");
+      mlstyle = dwg_add_MLINESTYLE (dwg, "AngleStyle");
+      dict = dwg_add_DICTIONARY (dwg, "DXFB_ANGLES", NULL, 0);
+      xrecord = dict ? dwg_add_XRECORD (dict, "RawReal") : NULL;
+      if (!block || !dwg_add_BLOCK (block, "AngleBlock")
+          || !dwg_add_LINE (block, &center, &end) || !dwg_add_ENDBLK (block)
+          || !dwg_add_INSERT (mspace, &center, "AngleBlock", 1.25, 0.75, 1.0,
+                              deg2rad (73.25))
+          || !arc || !text || !ellipse || !mtext || !vport || !mlstyle
+          || !xrecord || !dwg_add_XRECORD_real (xrecord, 50, 0.875))
+        {
+          dwg_free (dwg);
+          free (dwg);
+          loglevel = lvl;
+          fail ("dxfb_angles: cannot add the entities and objects");
+          return 1;
+        }
+      // the add API normalizes to [-pi, pi], store the end angle above pi
+      arc->end_angle = deg2rad (203.25);
+      text->rotation = deg2rad (37.5);
+      text->oblique_angle = deg2rad (-17.25);
+      ellipse->start_angle = 0.625;
+      ellipse->end_angle = 4.875;
+      mtext->x_axis_dir.x = cos (0.75);
+      mtext->x_axis_dir.y = sin (0.75);
+      mtext->x_axis_dir.z = 0.0;
+      vport->SNAPANG = deg2rad (42.25);
+      vport->VIEWTWIST = deg2rad (23.5);
+      mlstyle->start_angle = deg2rad (60.0);
+      mlstyle->end_angle = deg2rad (75.0);
+      dwg->header_vars.ANGBASE = deg2rad (11.75);
+
+      unlink (file);
+      error = dxf_write_file (file, dwg, binary);
+      dwg_free (dwg);
+      free (dwg);
+      loglevel = lvl;
+      if (error < DWG_ERR_CRITICAL)
+        buf = dxf_written_file (file, &size);
+      unlink (file);
+      if (!buf)
+        fail ("dxfb_angles binary=%d: dxf_write_file 0x%x", binary, error);
+      else if (!dxf_written_reals (buf, size, binary, reals, n))
+        fail ("dxfb_angles binary=%d: cannot walk the written groups", binary);
+      else
+        ok ("dxfb_angles binary=%d: all groups walked", binary);
+      free (buf);
+      for (i = 0; i < n; i++)
+        {
+          const struct dxf_written_real *r = &reals[i];
+          if (r->found && fabs (r->value - r->expected) <= 1e-9)
+            ok ("dxfb_angles binary=%d: %s %d %g", binary, r->record, r->code,
+                r->expected);
+          else if (r->found)
+            fail ("dxfb_angles binary=%d: %s %d is %.17g, expected %g", binary,
+                  r->record, r->code, r->value, r->expected);
+          else
+            fail ("dxfb_angles binary=%d: %s %d not written", binary,
+                  r->record, r->code);
+        }
+    }
+  return numfailed ();
+}
+
 /* GHSA-vj62-wp5x-vw7v: a BLOCK_HEADER reconstructed from JSON or DXF may lack
    its parent or its object data. The block and entity walkers must return
    NULL for it, and the DXF writers skip it, instead of dereferencing it. */
@@ -3903,6 +4196,7 @@ main (int argc, char *argv[])
   error += test_lwpolyline_to_preR13 ();
   error += test_lwpolyline_to_preR13_dxf ();
   error += test_dxf_write_file ();
+  error += test_dxfb_angles ();
   error += test_incomplete_block_header ();
 #  ifndef DISABLE_JSON
   error += test_json_write_file ();
